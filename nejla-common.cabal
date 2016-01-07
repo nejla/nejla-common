@@ -1,0 +1,42 @@
+name:               nejla-common
+version:            0.0.0.0
+synopsis:           Common functionality for Nejla Reference Architecture applications
+description:        Common functionality for Nejla Reference Architecture applications.
+homepage:           https://github.com/nejla/nejla-common
+license:            BSD3
+license-file:       LICENSE
+maintainer:         info@nejla.com
+copyright:          Nejla AB, 2016
+category:           Development
+build-type:         Simple
+extra-source-files: README.md
+cabal-version:      >=1.10
+
+library
+  exposed-modules:  NejlaCommon
+  build-depends:    aeson
+                  , base >=4.7 && <5.0
+                  , bytestring
+                  , data-default
+                  , esqueleto
+                  , exceptions >= 0.8
+                  , http-api-data
+                  , generic-aeson
+                  , json-schema
+                  , lens
+                  , monad-logger
+                  , mtl >= 2.2
+                  , path-pieces
+                  , persistent
+                  , persistent-postgresql
+                  , persistent-template
+                  , rest-types
+                  , singletons >= 1.1
+                  , template-haskell
+                  , text
+                  , time >= 1.5
+                  , transformers
+                  , unordered-containers
+                  , uuid
+  hs-source-dirs:   source
+  default-language: Haskell2010
