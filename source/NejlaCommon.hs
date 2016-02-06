@@ -10,7 +10,8 @@
 -- 'UUID' instances: 'PersistField', 'PersistFieldSql', 'FromJSON', 'ToJSON',
 -- 'JSONSchema', 'PathPiece', 'Info' as well as 'FromHttpApiData' and
 -- 'ToHttpApiData'.
-module NejlaCommon ( DerivedData(..)
+module NejlaCommon ( module NejlaCommon.Wai
+                   , DerivedData(..)
                    , WithField(..)
                    , derivedType
                    , mkGenericJSON
@@ -56,6 +57,8 @@ import qualified Data.Text as TS
 import qualified Rest.Types.Info as Rest
 import qualified Data.Text.Encoding as TS
 
+import NejlaCommon.Wai
+
 instance PersistField UUID where
     toPersistValue = toPersistValue . BS.concat . BSL.toChunks . toByteString
     fromPersistValue = \x -> fromPersistValue x >>= \v ->
@@ -96,16 +99,24 @@ instance FromHttpApiData UUID where
 -- of threads.
 withPool :: Int -> (ConnectionPool -> LoggingT IO b) -> IO b
 withPool n f = do
-    dbPassword <- TS.encodeUtf8 . TS.pack <$> getEnv "DB_PASSWORD"
-    (runStderrLoggingT . withPostgresqlPool (connectionString dbPassword) n) f
+    dbHost <-  maybe "database" toBS <$> lookupEnv "DB_HOST"
+    dbUser <- maybe "postgres" toBS <$> lookupEnv "DB_USER"
+    dbDatabase <- fmap toBS <$> lookupEnv "DB_DATABASE"
+    dbPassword <- fmap toBS <$> lookupEnv "DB_PASSWORD"
+    let connectionString =
+          BS.intercalate " "
+          . catMaybes
+            $ [ "host"     .= Just dbHost
+              , "user"     .= Just dbUser
+              , "dbname"   .= dbDatabase
+              , "password" .= dbPassword
+              ]
+    (runStderrLoggingT . withPostgresqlPool connectionString n) f
   where
-    connectionString passwd = BS.intercalate " "
-                              $ [ "host"     .= "database"
-                                , "user"     .= "nejla"
-                                , "dbname"   .= "nejla"
-                                , "password" .= passwd
-                                ]
-    k .= v = k <> "=" <> v
+    toBS = TS.encodeUtf8 . TS.pack
+
+    k .= (Just v) = Just $ k <> "=" <> v
+    k .= Nothing = Nothing
 
 -- | Create "trivial" instances for 'FromJSON', 'ToJSON', 'JSONSchema'. The
 -- instance members are set to 'gparseJsonWithSettings', 'gtoJsonWithSettings'
