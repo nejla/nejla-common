@@ -2,8 +2,6 @@ This repository provides shared functionality, template solutions, documentation
 
 The reference architecture currently assumes Haskell, GHC, Cabal, Persistent, PostgreSQL, and REST APIs.
 
-Copyright © 2014-2017 Nejla AB. All rights reserved.
-
 # Using the App Monad
 
 Many applications need to access a database and keep track of application
