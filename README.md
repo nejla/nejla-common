@@ -317,3 +317,8 @@ option for fixing them. That's where `camelCaseFieldsReplacing` helps: you can
 give it a HashMap of replacements which are applied to
 fields. `camelCaseFields'` comes with default replacements for "type" to "type'"
 and "default" to "default'".
+
+Legal
+-----
+
+Copyright © 2014-2017 Nejla AB. All rights reserved.
