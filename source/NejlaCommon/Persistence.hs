@@ -1,5 +1,9 @@
 -- Copyright © 2014-2015 Lambdatrade AB. All rights reserved.
 
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE Rank2Types #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DataKinds #-}
@@ -100,18 +104,24 @@ module NejlaCommon.Persistence
   , foreignKeyL
   , foreignKeyR
   , foreignKeyLR
+  , foreignKeyLMaybe
   , foreignKeyRMaybe
+  , foreignKeyLRMaybe
   , onForeignKey
+  -- ** Automatic generation of Foreign Relationships
+  , mkForeignInstances
   -- * Human-readable IDs
   , mkRandomHrID
   , mkUniqueRandomHrID
   ) where
 
-import           Control.Concurrent
+import           Control.Concurrent                (threadDelay)
+import           Control.Concurrent.Async
 import qualified Control.Lens                      as L
 import           Control.Lens.TH
 import           Control.Monad.Base
 import qualified Control.Monad.Catch               as Ex
+import           Control.Monad.IO.Unlift           (MonadUnliftIO)
 import           Control.Monad.Logger
 import           Control.Monad.Reader
 import           Control.Monad.Trans.Control
@@ -121,10 +131,11 @@ import           Data.ByteString                   (ByteString)
 import           Data.Data
 import           Data.Default
 import qualified Data.Foldable                     as Foldable
-import           Data.IORef
+import qualified Data.Function                     as Function
 import qualified Data.List                         as List
 import           Data.Maybe                        (catMaybes, maybeToList)
 import           Data.Monoid
+import qualified Data.Ord                          as Ord
 import           Data.Singletons
 import           Data.Singletons.TH
 import           Data.Text                         (Text)
@@ -139,8 +150,11 @@ import qualified Database.Esqueleto.PostgreSQL     as Postgres
 import qualified Database.PostgreSQL.Simple        as Postgres
 import           Database.PostgreSQL.Simple.Errors
 import           GHC.Generics
+import qualified Language.Haskell.TH               as TH
 import           System.Random
 import           System.Random.Shuffle
+
+import           NejlaCommon.Helpers
 
 --------------------------------------------------------------------------------
 -- SQL Monad -------------------------------------------------------------------
@@ -176,6 +190,8 @@ promoteOrdInstances  [''Privilege, ''TransactionLevel]
 -- | Application state
 data AppState st = AppState { appStateConnection :: !SqlBackend
                             -- ^ The database connection to work with
+                            , appStatePool :: !ConnectionPool
+                            -- ^ Pool of SQL connections
                             , appStateUserState  :: !st
                             -- ^ User state
                             } deriving ( Typeable, Generic)
@@ -206,7 +222,9 @@ viewState f = App . L.view $ userState . f
 newtype App (st :: *) (r :: Privilege) (l :: TransactionLevel)
             a = App {unApp :: ReaderT (AppState st) IO a}
                    deriving (Functor, Applicative, Monad, MonadIO
-                            , Ex.MonadThrow, Ex.MonadCatch, MonadBase IO)
+                            , Ex.MonadThrow, Ex.MonadCatch, Ex.MonadMask
+                            , MonadBase IO, MonadUnliftIO
+                            )
 
 instance MonadBaseControl IO (App st r l) where
   type StM (App st r l) a = a
@@ -281,6 +299,7 @@ runApp tLevel conf pool ust ((App m) :: App st p l a) =
       setTransactionLevel (fromSing tLevel)
     con <- ask
     let st = AppState { appStateConnection = con
+                      , appStatePool = pool
                       , appStateUserState = ust
                       }
     liftIO $ Ex.catch (go con st $ conf L.^. numRetries) $
@@ -370,12 +389,17 @@ withRepeatableRead (App m) = App m
 withSerializable :: App st p l a -> App st p 'Serializable a
 withSerializable (App m) = App m
 
--- | Run an app action in a new haskell thread
-forkApp :: App st p r () -> App st p r ()
+-- | Run an app action in a new haskell thread using a fresh SQL connection
+forkApp :: App st p r a -> App st p r (Async a)
 forkApp (App m) = do
   st <- App ask
-  _ <- liftIO . forkIO $ runReaderT m st
-  return ()
+  let thread = do
+        -- Grab a new connection so we don't leak the current one
+        flip runSqlPool (appStatePool st) $ do
+          con <- ask
+          let st' = st {appStateConnection = con}
+          liftIO $ runReaderT m st'
+  liftIO $ async thread
 
 --------------------------------------------------------------------------------
 -- Errors ----------------------------------------------------------------------
@@ -525,8 +549,6 @@ offsetLimit os l = do
     Foldable.forM_ l $ limit . fromIntegral
     return ()
 
-
-
 type SV a  = SqlExpr (Entity a)
 type SVM a = SqlExpr (Maybe (Entity a))
 
@@ -543,12 +565,12 @@ arrayAgg' =  arrayRemoveNull . Postgres.arrayAgg
 -- App helpers (Postgres specific) ---------------------------------------------
 --------------------------------------------------------------------------------
 
+infixl 5 `jsonField`, `jsonFieldText`
+
 -- | Class of Haskell types that are represented as json in postgres
 class SqlJSON a where
 
 instance SqlJSON Aeson.Value
-
-infixl 5 `jsonField`, `jsonFieldText`
 
 -- | postgresql (->) (object indexing) function
 jsonField :: (SqlJSON a, SqlJSON b) =>
@@ -557,14 +579,15 @@ jsonField :: (SqlJSON a, SqlJSON b) =>
           -> SqlExpr (Value b)
 jsonField = unsafeSqlBinOp "->"
 
--- | postgresql (->) (object indexing) function
+-- | postgresql (->>) (object indexing) function
 jsonFieldText :: (SqlJSON a) =>
                  SqlExpr (Value a)
               -> SqlExpr (Value Text)
               -> SqlExpr (Value (Maybe Text))
 jsonFieldText = unsafeSqlBinOp "->>"
 
--- | postgresql (->) (object indexing) function
+-- | postgresql (->>) object indexing function with the argument interpreted as
+-- a UUID
 jsonFieldUUID :: SqlJSON a =>
                  SqlExpr (Value a)
               -> SqlExpr (Value Text)
@@ -692,7 +715,7 @@ fromMaybeNotFound entType entName item' =
 -- Foreign Key Relationships ---------------------------------------------------
 --------------------------------------------------------------------------------
 
--- | Describe a Pair of keys that form a foreign key relationship.
+-- | Describe a Pair of keys that are part of a foreign key relationship.
 --
 -- The first element is the entity field that holds the foreign key. The second
 -- element is the entity field that holds the references primary key. Type of
@@ -716,26 +739,38 @@ fromMaybeNotFound entType entName item' =
 --
 -- @ForeignPair TeamEmployee EmployeeNum@
 
-data ForeignPair a b where
-    ForeignPair :: (PersistEntity a, PersistEntity b, PersistField f) =>
+data ForeignPair :: * -> * -> * where
+    ForeignPair :: forall a b f.
+                   (PersistEntity a, PersistEntity b, PersistField f) =>
                     EntityField a f
                  -> EntityField b f
                  -> ForeignPair a b
 
-
--- | Describe a unique, canonical foreign key relationship between entities,
--- . For example, given the entity definitions from 'ForeignPair', there is
--- exactly one foreign key relationship between Employee and Team, so we can capture it in a type class:
+-- | Describe a unique, canonical foreign key relationship between entities. For
+-- example, given the entity definitions from 'ForeignPair', there is exactly
+-- one foreign key relationship between Employee and Team, so we can capture it
+-- in a type class:
 --
 -- @
 -- instance ForeignKey Team Employee where
---     foreignPair = ForeignPair TeamEmployee EmployeeNum
+--     foreignPairs = [ForeignPair TeamEmployee EmployeeNum]
 -- @
 --
 -- Note that the entity with the foreign key is the _first_ parameter of the
 -- type class, the target entity the second
 class ForeignKey a b where
-    foreignPair :: ForeignPair a b
+  foreignPairs :: [ForeignPair a b]
+
+-- | Apply f to each pair of foreign fields (most likely some variant of equality)
+withForeignPairs ::
+     (ForeignKey a b, Esqueleto query expr backend)
+  => (forall f. (PersistField f, PersistEntity a, PersistEntity b)  =>
+                EntityField a f
+             -> EntityField b f
+             -> expr (Value Bool))
+  -> expr (Value Bool)
+withForeignPairs f = andL . flip map (foreignPairs) $ \case
+  (ForeignPair xk yk) -> f xk yk
 
 -- | A foreign key constraint between two entities.
 --
@@ -748,33 +783,22 @@ class ForeignKey a b where
 -- @
 foreignKey :: (ForeignKey a b, Esqueleto query expr backend) =>
               expr (Entity a) -> expr (Entity b) -> expr (Value Bool)
-foreignKey x y =
-    case foreignPair of
-     (ForeignPair xk yk) -> x ^. xk ==. y ^. yk
+foreignKey x y = withForeignPairs $ \xk yk -> x ^. xk ==. y ^. yk
 
--- | Similar to foreignKey, except that the foreign key can be nullable
--- . However, it will only match if the key is actually set
+-- | 'foreignKey' for 'RightOuterJoin'
 foreignKeyR  :: (ForeignKey a b, Esqueleto query expr backend) =>
                expr (Entity a) -> expr (Maybe (Entity b)) -> expr (Value Bool)
-foreignKeyR x y =
-    case foreignPair of
-     (ForeignPair xk yk) -> just (x ^. xk) ==. y ?. yk
+foreignKeyR x y = withForeignPairs $ \xk yk ->just (x ^. xk) ==. y ?. yk
 
--- | Similar to foreignKey, except that the foreign key can be nullable
--- . However, it will only match if the key is actually set
+-- | 'foreignKey' for 'LeftOuterJoin'
 foreignKeyL  :: (ForeignKey a b, Esqueleto query expr backend) =>
                expr (Maybe (Entity a)) -> expr (Entity b) -> expr (Value Bool)
-foreignKeyL x y =
-    case foreignPair of
-     (ForeignPair xk yk) -> (x ?. xk) ==. just (y ^. yk)
+foreignKeyL x y = withForeignPairs $ \xk yk ->(x ?. xk) ==. just (y ^. yk)
 
--- | Similar to foreignKey, except that the foreign key can be nullable
--- . However, it will only match if the key is actually set
+-- | 'foreignKey' for 'FullOuterJoin'
 foreignKeyLR  :: (ForeignKey a b, Esqueleto query expr backend) =>
                expr (Maybe (Entity a)) -> expr (Maybe (Entity b)) -> expr (Value Bool)
-foreignKeyLR x y =
-    case foreignPair of
-     (ForeignPair xk yk) -> (x ?. xk) ==. (y ?. yk)
+foreignKeyLR x y = withForeignPairs $ \xk yk ->(x ?. xk) ==. (y ?. yk)
 
 -- | Compare an entity field to a Haskell 'Maybe' value. NOTE: Simply using
 -- @==.@ does __not__ work! @NULL ==. Nothing@ will evaluate to @NULL@!
@@ -785,17 +809,41 @@ mbEq v1 Nothing  = isNothing v1
 mbEq v1 (Just v2)  = v1 ==. just (val v2)
 
 
--- | Like foreignKeyR, but also matches if the foreign key field is NULL
+-- | Like foreignKeyL, but also matches if the foreign reference is NULL
+foreignKeyLMaybe :: (Esqueleto query expr backend, ForeignKey a b) =>
+                    expr (Maybe( Entity a))
+                 -> expr (Entity b)
+                 -> expr (Value Bool)
+foreignKeyLMaybe x y =
+  withForeignPairs $ \xk yk ->
+         orL [ isNothing (x ?. xk)
+             , x ?. xk ==. just (y ^. yk)
+             ]
+
+-- | Like foreignKeyR, but also matches if the target key field is NULL
 foreignKeyRMaybe :: (Esqueleto query expr backend, ForeignKey a b) =>
                     expr (Entity a)
                  -> expr (Maybe (Entity b))
                  -> expr (Value Bool)
 foreignKeyRMaybe x y =
-    case foreignPair of
-     (ForeignPair xk yk) ->
+  withForeignPairs $ \xk yk ->
          orL [ isNothing (y ?. yk)
              , just (x ^. xk) ==. y ?. yk
              ]
+
+-- | Like foreignKeyLR, but also matches if foreign reference or target key are
+-- null
+foreignKeyLRMaybe :: (Esqueleto query expr backend, ForeignKey a b) =>
+                    expr (Maybe( Entity a))
+                 -> expr (Maybe (Entity b))
+                 -> expr (Value Bool)
+foreignKeyLRMaybe x y =
+  withForeignPairs $ \xk yk ->
+         orL [ isNothing (x ?. xk)
+             , isNothing (y ?. yk)
+             , x ?. xk ==. y ?. yk
+             ]
+
 -- | ON for a foreign key pair
 --
 -- @onForeignKey a b === on (foreignKey a b)@
@@ -811,6 +859,79 @@ onForeignKey :: (Esqueleto query expr backend, ForeignKey a b) =>
 onForeignKey x y = on $ foreignKey x y
 
 --------------------------------------------------------------------------------
+-- Automatic Generation of Foreign Key Pairs -----------------------------------
+--------------------------------------------------------------------------------
+
+-- | Calculate the foreign relationships from entity definitions.  The resulting
+-- list is for each entity the entity it refers to and a list of field pairs
+foreignEnts :: [EntityDef] -> [((String, String), [[(String, String)]])]
+foreignEnts ents = merge $ do
+  ent <- ents
+  let entName = unHaskellName $ entityHaskell ent
+  -- References to the implicit EntityId fields
+  let implicits = do
+        field <- entityFields ent
+        let nm = unHaskellName $ fieldHaskell field
+        ref <- fromForeignRefs $ fieldReference field
+        return ( (Text.unpack entName, Text.unpack ref)
+               , [(toField entName nm
+                  , Text.unpack $  ref <> "Id")])
+  -- References that use explicit »Primary« and »Foreign» declarations
+      explicits = do
+        frgn <- entityForeigns ent
+        let remote = unHaskellName $ foreignRefTableHaskell frgn
+        return . ((Text.unpack entName,  Text.unpack remote), ) $ do
+          ((HaskellName f, _), (HaskellName t, _)) <- foreignFields frgn
+          return (toField entName f, toField remote t)
+  implicits <> explicits
+  where
+    merge =
+      -- Head is OK here because group never returns emtpty lists.
+      map (\xs -> (fst $ head xs, snd <$> xs)) .
+      List.groupBy ((==) `Function.on` fst)
+      . List.sortBy (Ord.comparing fst)
+
+    fromForeignRefs (ForeignRef x _ ) = pure $ unHaskellName x
+    fromForeignRefs _ = mempty
+    upcase' = upcase . Text.unpack
+    toField ent name = Text.unpack ent <> (upcase' name)
+
+-- | Automatically create ForeignKey instances
+mkForeignInstances :: [EntityDef] -> TH.Q [TH.Dec]
+mkForeignInstances ents = do
+  let defs = foreignEnts ents
+  concatForM defs $ \((f, t), pairss) ->
+    case pairss of
+      [] -> error "mkForeignInstances: Empty group"
+      [pairs'] ->
+        let foreignPairs' =
+              [[|ForeignPair $(TH.conE $ TH.mkName x)
+                             $(TH.conE $ TH.mkName y)
+                |]
+               | (x,y) <- pairs'
+              ]
+        in [d|
+          instance ForeignKey $(TH.conT $ TH.mkName f)
+                              $(TH.conT $ TH.mkName t) where
+            foreignPairs = $(TH.listE foreignPairs')
+
+           |]
+      _ -> do
+        TH.reportWarning
+              $ concat [ "More than one possible Foreign instance for "
+                       , f, " => ", t , ": \n"
+                       , List.intercalate "\n"
+                           . map ("      " <>) . for pairss $ \pairs' ->
+                           List.intercalate ", " $ for pairs' $ \(f', t') ->
+                             concat [f' , " -> ", t']
+                       , "\n  Please create instances by hand"
+                       ]
+        return []
+  where
+    for = flip map
+    concatForM xs f = concat <$> forM xs f
+
+--------------------------------------------------------------------------------
 -- ID generation ---------------------------------------------------------------
 --------------------------------------------------------------------------------
 
@@ -822,7 +943,7 @@ hrIDDigits = "2345679"
 -- | Letters for human-readable ID generation. Vovels are not included to avoid
 -- accidentally spelling profanities.
 hrIDChars :: [Char]
-hrIDChars = "CDFGHJKLMNPQRSTVWXYZ" ++ hrIDDigits
+hrIDChars = "CDFGHJKLMNPQRSTVWXYZ" <> hrIDDigits
 
 -- | Generate a random human-readable ID.
 mkRandomHrID :: Int -> IO Text
