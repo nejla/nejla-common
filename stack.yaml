@@ -1,6 +1,13 @@
-resolver: lts-10.10
+resolver: lts-16.22
 packages:
-- location: '.'
-extra-deps: []
 flags: {}
+
+extra-deps:
+  - hspec-wai-json-0.10.1
+
 extra-package-dbs: []
+
+nix:
+  packages:
+    - zlib
+    - postgresql

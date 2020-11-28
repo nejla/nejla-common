@@ -24,6 +24,8 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
 module NejlaCommon.Persistence
   ( -- * SQL Monad
     Privilege (..)
@@ -55,6 +57,13 @@ module NejlaCommon.Persistence
   , withRepeatableRead
   , withSerializable
   , forkApp
+  -- * Database setup and connectivity
+  , getDBConnectInfo
+  , withDBPool
+  , runPoolRetry
+  -- ** Deprecated functionality
+  , withPoolNoWait
+  , withPool
   -- * Persistence Helpers
   , checkmarkToBool
   , boolToCheckmark
@@ -72,6 +81,9 @@ module NejlaCommon.Persistence
   , mbEq
   , offsetLimit
   -- * SQL helpers
+  , Postgres.ConnectInfo(..)
+  , Postgres.defaultConnectInfo
+  , Postgres.postgreSQLConnectionString
   , SV
   , SVM
   , jsonField
@@ -134,7 +146,6 @@ import qualified Data.Foldable                     as Foldable
 import qualified Data.Function                     as Function
 import qualified Data.List                         as List
 import           Data.Maybe                        (catMaybes, maybeToList)
-import           Data.Monoid
 import qualified Data.Ord                          as Ord
 import           Data.Singletons
 import           Data.Singletons.TH
@@ -144,17 +155,40 @@ import qualified Data.Text.Encoding                as Text
 import qualified Data.Text.Encoding.Error          as Text
 import           Data.Time
 import           Data.UUID                         (UUID)
-import           Database.Esqueleto                as E
+import qualified Data.UUID                         as UUID
+import           Database.Esqueleto                ( SqlBackend, ConnectionPool
+                                                   , Checkmark(..)
+                                                   , Value(..), Entity(..)
+                                                   , PersistField(..)
+                                                   , PersistEntity(..)
+                                                   , EntityDef, HaskellName(..)
+                                                   , ReferenceDef(..)
+                                                   , where_, val, (&&.), (||.)
+                                                   , on, offset, limit
+                                                   , (^.), (?.), (==.), just
+                                                   , isNothing
+                                                   )
+import qualified Database.Esqueleto                as E
+
+import qualified Data.Text                         as TS
 import           Database.Esqueleto.Internal.Sql
 import qualified Database.Esqueleto.PostgreSQL     as Postgres
+import           Database.Persist.Postgresql       ( PersistFieldSql
+                                                   , PersistValue(..)
+                                                   , SqlType(..)
+                                                   , withPostgresqlPool
+                                                   )
 import qualified Database.PostgreSQL.Simple        as Postgres
 import           Database.PostgreSQL.Simple.Errors
 import           GHC.Generics
 import qualified Language.Haskell.TH               as TH
 import           System.Random
 import           System.Random.Shuffle
+import           Web.PathPieces
 
 import           NejlaCommon.Helpers
+import           NejlaCommon.Config
+import qualified NejlaCommon.Persistence.Migration as Migration
 
 --------------------------------------------------------------------------------
 -- SQL Monad -------------------------------------------------------------------
@@ -177,7 +211,7 @@ data TransactionLevel = ReadCommitted
 -- be run at the beginning of the transaction
 setTransactionLevel :: MonadIO m => TransactionLevel -> ReaderT SqlBackend m ()
 setTransactionLevel l = do
-    rawExecute ("SET TRANSACTION ISOLATION LEVEL " <> level  l) []
+    E.rawExecute ("SET TRANSACTION ISOLATION LEVEL " <> level  l) []
   where
     level Serializable = "SERIALIZABLE"
     level RepeatableRead = "REPEATABLE READ"
@@ -221,7 +255,7 @@ viewState f = App . L.view $ userState . f
 -- | An App action running in a privilege context @r@ with transaction level @l@
 newtype App (st :: *) (r :: Privilege) (l :: TransactionLevel)
             a = App {unApp :: ReaderT (AppState st) IO a}
-                   deriving (Functor, Applicative, Monad, MonadIO
+                   deriving (Functor, Applicative, Monad, MonadFail, MonadIO
                             , Ex.MonadThrow, Ex.MonadCatch, Ex.MonadMask
                             , MonadBase IO, MonadUnliftIO
                             )
@@ -238,8 +272,12 @@ instance MonadLogger (App st r l) where
   monadLoggerLog loc logSource logLevel logStr = do
     -- We use the log function stored in the SqlBackend
     con <- App $ L.view connection
-    liftIO $ connLogFunc con loc logSource logLevel $ toLogStr logStr
+    liftIO $ E.connLogFunc con loc logSource logLevel $ toLogStr logStr
 
+instance MonadLoggerIO (App st r l) where
+  askLoggerIO = do
+    con <- App $ L.view connection
+    return $ E.connLogFunc con
 
 data SqlConfig = SqlConfig { -- | How often to retry the transaction (0 to
                              -- disable retries completely)
@@ -274,7 +312,7 @@ makeLensesWith camelCaseFields ''SqlConfig
 defaultSqlConfig :: SqlConfig
 defaultSqlConfig = SqlConfig { sqlConfigNumRetries = 3
                              , sqlConfigRetryMinDelay = 0 -- 0 ms
-                             , sqlConfigRetryMaxDelay = 100000 -- 0 ms
+                             , sqlConfigRetryMaxDelay = 100000 -- 100 ms
                              , sqlConfigRetryableErrors
                                =  [ "40001" -- serialization_failure
                                   , "40P01" -- deadlock_detected
@@ -294,7 +332,7 @@ runApp :: Sing l -- ^ mode to run the transaction in (see 'serializable',
        -> App st p l a
        -> IO a
 runApp tLevel conf pool ust ((App m) :: App st p l a) =
-  flip runSqlPool pool $ do
+  flip E.runSqlPool pool $ do
     when (conf L.^. useTransactionLevels) $
       setTransactionLevel (fromSing tLevel)
     con <- ask
@@ -317,7 +355,7 @@ runApp tLevel conf pool ust ((App m) :: App st p l a) =
     utf8 = Text.decodeUtf8With Text.lenientDecode
     go con st retries = do
         Ex.catch (liftIO $ runReaderT m st) $ \e -> do
-          runReaderT transactionUndo con
+          runReaderT E.transactionUndo con
           case Postgres.sqlState e `elem` (conf L.^. retryableErrors)
                && retries > 0
             of
@@ -368,8 +406,8 @@ db' :: ReaderT SqlBackend IO b -> App st 'Privileged 'ReadCommitted b
 db' = unprivileged . db
 {-# INLINE db' #-}
 
--- | Run a lower-loeveled action in a higher-leveled context
-withLevel :: ((newLevel :<= oldLevel) ~ 'True) =>
+-- | Run a lower-leveled action in a higher-leveled context
+withLevel :: ((newLevel <= oldLevel) ~ 'True) =>
              App st p newLevel a
           -> App st p oldLevel a
 withLevel (App m) = App m
@@ -380,7 +418,7 @@ withReadCommitted :: App st p 'ReadCommitted a
 withReadCommitted (App m) = (App m)
 
 -- | Annotate or upgrade an operation as requiring Repeatable Read
-withRepeatableRead :: ((l :<= 'RepeatableRead) ~ 'True) =>
+withRepeatableRead :: ((l <= 'RepeatableRead) ~ 'True) =>
                       App st p l a
                    -> App st p 'RepeatableRead a
 withRepeatableRead (App m) = App m
@@ -395,7 +433,7 @@ forkApp (App m) = do
   st <- App ask
   let thread = do
         -- Grab a new connection so we don't leak the current one
-        flip runSqlPool (appStatePool st) $ do
+        flip E.runSqlPool (appStatePool st) $ do
           con <- ask
           let st' = st {appStateConnection = con}
           liftIO $ runReaderT m st'
@@ -498,52 +536,45 @@ boolCheckmark = L.iso boolToCheckmark checkmarkToBool
 --------------------------------------------------------------------------------
 
 -- | @OR@ a list of predicates. An empty list becomes 'False'
-orL :: Esqueleto query expr backend =>
-       [expr (Value Bool)]
-    -> expr (Value Bool)
+orL :: [SqlExpr (Value Bool)]
+    -> SqlExpr (Value Bool)
 orL [] = val False
 orL (p:ps) = List.foldl' (||.) p ps
 
 -- | @AND@ a list of predicates. An Empty list becomes 'True'
-andL :: Esqueleto query expr backend =>
-        [expr (Value Bool)] -> expr (Value Bool)
+andL :: [SqlExpr (Value Bool)] -> SqlExpr (Value Bool)
 andL [] = val True
 andL (p:ps) = List.foldl' (&&.) p ps
 
 -- | @AND@ a list of predicates (ignoring Nothing values).
-andLMb :: Esqueleto query expr backend =>
-          [Maybe (expr (Value Bool))]
-       -> expr (Value Bool)
+andLMb :: [Maybe (SqlExpr (Value Bool))]
+       -> SqlExpr (Value Bool)
 andLMb = andL . catMaybes
 
 -- | @WHERE@ on a list of predicates (conjunction)
-whereL :: Esqueleto query expr backend => [expr (Value Bool)] -> query ()
+whereL :: [SqlExpr (Value Bool)] -> SqlQuery ()
 whereL [] = return ()
 whereL xs = where_ $ andL xs
 
 -- | WHERE on a list of optional predicates (conjunction, ignoring 'Nothing''s)
-whereLMb :: Esqueleto query expr backend =>
-            [Maybe (expr (Value Bool))] -> query ()
+whereLMb :: [Maybe (SqlExpr (Value Bool))] -> SqlQuery ()
 whereLMb = whereL . catMaybes
 
 -- | ON on a list of predicates.
-onL :: Esqueleto query expr backend =>
-       [expr (Value Bool)]
-    -> query ()
+onL :: [SqlExpr (Value Bool)]
+    -> SqlQuery ()
 -- ON will be preserved even if the list is empty. This is important.
 onL = on . andL
 
 -- | ON on a list of optional predicates, ignoring Nothings
-onLMb :: Esqueleto query expr backend =>
-         [Maybe (expr (Value Bool))]
-      -> query ()
+onLMb :: [Maybe (SqlExpr (Value Bool))]
+      -> SqlQuery ()
 onLMb = onL . catMaybes
 
 -- | Set offset and limit for the query.
-offsetLimit  :: (Esqueleto m expr backend ) =>
-                Maybe Int
+offsetLimit  :: Maybe Int
              -> Maybe Int
-             -> m ()
+             -> SqlQuery ()
 offsetLimit os l = do
     Foldable.forM_ os $ offset . fromIntegral
     Foldable.forM_ l $ limit . fromIntegral
@@ -555,11 +586,11 @@ type SVM a = SqlExpr (Maybe (Entity a))
 emptyArray :: SqlExpr (Value [a])
 emptyArray = unsafeSqlValue "'{}'"
 
-arrayRemoveNull :: SqlExpr (Value [Maybe a]) -> SqlExpr (Value [a])
-arrayRemoveNull x = unsafeSqlFunction "array_remove" (x, unsafeSqlValue "NULL")
-
-arrayAgg' :: PersistField [a] => SqlExpr (Value (Maybe a)) -> SqlExpr (Value [a])
-arrayAgg' =  arrayRemoveNull . Postgres.arrayAgg
+arrayAgg' :: PersistField [a] => SqlExpr (Value (Maybe a))
+                              -> SqlExpr (Value [a])
+arrayAgg' x =
+  Postgres.arrayRemoveNull $
+  Postgres.unsafeSqlAggregateFunction "array_agg" Postgres.AggModeAll x []
 
 --------------------------------------------------------------------------------
 -- App helpers (Postgres specific) ---------------------------------------------
@@ -608,11 +639,11 @@ sqlFormatTime time formatstring = unsafeSqlFunction "to_char" (time, formatstrin
 
 -- | Set constraints to DEFERRED
 deferrConstraints :: MonadIO m => ReaderT SqlBackend m ()
-deferrConstraints = rawExecute "SET CONSTRAINTS ALL DEFERRED;" []
+deferrConstraints = E.rawExecute "SET CONSTRAINTS ALL DEFERRED;" []
 
 -- | Set constraints to IMMEDIATE
 undeferrConstraints :: MonadIO m => ReaderT SqlBackend m ()
-undeferrConstraints = rawExecute "SET CONSTRAINTS ALL IMMEDIATE;" []
+undeferrConstraints = E.rawExecute "SET CONSTRAINTS ALL IMMEDIATE;" []
 
 --------------------------------------------------------------------------------
 -- Uniquenes Constraints -------------------------------------------------------
@@ -648,9 +679,9 @@ insertUniqueConflict :: (DescribeUnique a, PersistEntityBackend a ~ SqlBackend) 
                         a
                      -> App st 'Privileged 'ReadCommitted (Key a)
 insertUniqueConflict x = do
-    mbCfl <- db' $ checkUnique x
+    mbCfl <- db' $ E.checkUnique x
     case mbCfl of
-     Nothing -> db' $ insert x
+     Nothing -> db' $ E.insert x
      Just cfl -> liftIO . Ex.throwM $ conflict cfl
 
 -- | Replace a value, throwing a Conflict exception when a uniqueness constraint
@@ -661,7 +692,7 @@ replaceUniqueConflict :: (Eq a, Eq (Unique a), DescribeUnique a,
                       -> a
                       -> App st 'Privileged 'ReadCommitted ()
 replaceUniqueConflict k v = do
-    mbCfl <- db' $ replaceUnique k v
+    mbCfl <- db' $ E.replaceUnique k v
     case mbCfl of
      Nothing -> return ()
      Just cfl -> liftIO . Ex.throwM $ conflict cfl
@@ -671,15 +702,15 @@ replaceUniqueConflict k v = do
 --------------------------------------------------------------------------------
 
 
-notFound :: (MonadIO m, Show a) => Text -> a -> m b
+notFound :: (Ex.MonadThrow m, Show a) => Text -> a -> m b
 notFound entType entName =
-    liftIO . Ex.throwM $ EntityNotFound entType (Text.pack $ show entName)
+    Ex.throwM $ EntityNotFound entType (Text.pack $ show entName)
 
 getByNotFound :: (PersistEntity val, Show a,
                   PersistEntityBackend val ~ SqlBackend) =>
                  Text -> a -> Unique val -> App st 'Unprivileged 'ReadCommitted (Entity val)
 getByNotFound entType entName p = do
-    g <- db $ getBy p
+    g <- db $ E.getBy p
     case g of
         Nothing -> notFound entType entName
         Just e -> return e
@@ -692,7 +723,7 @@ getByNotFound' p = getByNotFound (uniqueType p) (uniqueFieldNames p) p
 getNotFound :: (PersistEntity b, PersistEntityBackend b ~ SqlBackend) =>
                Text -> Key b -> App st 'Unprivileged 'ReadCommitted b
 getNotFound entType p = do
-    g <- db $ get p
+    g <- db $ E.get p
     case g of
         Nothing -> notFound entType p
         Just e -> return e
@@ -763,12 +794,12 @@ class ForeignKey a b where
 
 -- | Apply f to each pair of foreign fields (most likely some variant of equality)
 withForeignPairs ::
-     (ForeignKey a b, Esqueleto query expr backend)
+     (ForeignKey a b)
   => (forall f. (PersistField f, PersistEntity a, PersistEntity b)  =>
                 EntityField a f
              -> EntityField b f
-             -> expr (Value Bool))
-  -> expr (Value Bool)
+             -> SqlExpr (Value Bool))
+  -> SqlExpr (Value Bool)
 withForeignPairs f = andL . flip map (foreignPairs) $ \case
   (ForeignPair xk yk) -> f xk yk
 
@@ -781,39 +812,39 @@ withForeignPairs f = andL . flip map (foreignPairs) $ \case
 --   where_ (foreignKey team employee)
 --   [...]
 -- @
-foreignKey :: (ForeignKey a b, Esqueleto query expr backend) =>
-              expr (Entity a) -> expr (Entity b) -> expr (Value Bool)
+foreignKey :: (ForeignKey a b) =>
+              SqlExpr (Entity a) -> SqlExpr (Entity b) -> SqlExpr (Value Bool)
 foreignKey x y = withForeignPairs $ \xk yk -> x ^. xk ==. y ^. yk
 
 -- | 'foreignKey' for 'RightOuterJoin'
-foreignKeyR  :: (ForeignKey a b, Esqueleto query expr backend) =>
-               expr (Entity a) -> expr (Maybe (Entity b)) -> expr (Value Bool)
+foreignKeyR  :: (ForeignKey a b) =>
+               SqlExpr (Entity a) -> SqlExpr (Maybe (Entity b)) -> SqlExpr (Value Bool)
 foreignKeyR x y = withForeignPairs $ \xk yk ->just (x ^. xk) ==. y ?. yk
 
 -- | 'foreignKey' for 'LeftOuterJoin'
-foreignKeyL  :: (ForeignKey a b, Esqueleto query expr backend) =>
-               expr (Maybe (Entity a)) -> expr (Entity b) -> expr (Value Bool)
+foreignKeyL  :: (ForeignKey a b) =>
+               SqlExpr (Maybe (Entity a)) -> SqlExpr (Entity b) -> SqlExpr (Value Bool)
 foreignKeyL x y = withForeignPairs $ \xk yk ->(x ?. xk) ==. just (y ^. yk)
 
 -- | 'foreignKey' for 'FullOuterJoin'
-foreignKeyLR  :: (ForeignKey a b, Esqueleto query expr backend) =>
-               expr (Maybe (Entity a)) -> expr (Maybe (Entity b)) -> expr (Value Bool)
+foreignKeyLR  :: (ForeignKey a b) =>
+               SqlExpr (Maybe (Entity a)) -> SqlExpr (Maybe (Entity b)) -> SqlExpr (Value Bool)
 foreignKeyLR x y = withForeignPairs $ \xk yk ->(x ?. xk) ==. (y ?. yk)
 
 -- | Compare an entity field to a Haskell 'Maybe' value. NOTE: Simply using
 -- @==.@ does __not__ work! @NULL ==. Nothing@ will evaluate to @NULL@!
-mbEq :: (PersistField typ, Esqueleto query expr backend) =>
-        expr (Value (Maybe typ))
-     -> Maybe typ -> expr (Value Bool)
+mbEq :: (PersistField typ) =>
+        SqlExpr (Value (Maybe typ))
+     -> Maybe typ -> SqlExpr (Value Bool)
 mbEq v1 Nothing  = isNothing v1
 mbEq v1 (Just v2)  = v1 ==. just (val v2)
 
 
 -- | Like foreignKeyL, but also matches if the foreign reference is NULL
-foreignKeyLMaybe :: (Esqueleto query expr backend, ForeignKey a b) =>
-                    expr (Maybe( Entity a))
-                 -> expr (Entity b)
-                 -> expr (Value Bool)
+foreignKeyLMaybe :: (ForeignKey a b) =>
+                    SqlExpr (Maybe( Entity a))
+                 -> SqlExpr (Entity b)
+                 -> SqlExpr (Value Bool)
 foreignKeyLMaybe x y =
   withForeignPairs $ \xk yk ->
          orL [ isNothing (x ?. xk)
@@ -821,10 +852,10 @@ foreignKeyLMaybe x y =
              ]
 
 -- | Like foreignKeyR, but also matches if the target key field is NULL
-foreignKeyRMaybe :: (Esqueleto query expr backend, ForeignKey a b) =>
-                    expr (Entity a)
-                 -> expr (Maybe (Entity b))
-                 -> expr (Value Bool)
+foreignKeyRMaybe :: (ForeignKey a b) =>
+                    SqlExpr (Entity a)
+                 -> SqlExpr (Maybe (Entity b))
+                 -> SqlExpr (Value Bool)
 foreignKeyRMaybe x y =
   withForeignPairs $ \xk yk ->
          orL [ isNothing (y ?. yk)
@@ -833,10 +864,10 @@ foreignKeyRMaybe x y =
 
 -- | Like foreignKeyLR, but also matches if foreign reference or target key are
 -- null
-foreignKeyLRMaybe :: (Esqueleto query expr backend, ForeignKey a b) =>
-                    expr (Maybe( Entity a))
-                 -> expr (Maybe (Entity b))
-                 -> expr (Value Bool)
+foreignKeyLRMaybe :: (ForeignKey a b) =>
+                    SqlExpr (Maybe( Entity a))
+                 -> SqlExpr (Maybe (Entity b))
+                 -> SqlExpr (Value Bool)
 foreignKeyLRMaybe x y =
   withForeignPairs $ \xk yk ->
          orL [ isNothing (x ?. xk)
@@ -854,8 +885,8 @@ foreignKeyLRMaybe x y =
 -- from $ \(team \`InnerJoin\` employee) ->
 --   onForeignKey team employee
 -- @
-onForeignKey :: (Esqueleto query expr backend, ForeignKey a b) =>
-                expr (Entity a) -> expr (Entity b) -> query ()
+onForeignKey :: (ForeignKey a b) =>
+                SqlExpr (Entity a) -> SqlExpr (Entity b) -> SqlQuery ()
 onForeignKey x y = on $ foreignKey x y
 
 --------------------------------------------------------------------------------
@@ -867,21 +898,36 @@ onForeignKey x y = on $ foreignKey x y
 foreignEnts :: [EntityDef] -> [((String, String), [[(String, String)]])]
 foreignEnts ents = merge $ do
   ent <- ents
-  let entName = unHaskellName $ entityHaskell ent
+  let entName = unHaskellName $ E.entityHaskell ent
   -- References to the implicit EntityId fields
   let implicits = do
-        field <- entityFields ent
-        let nm = unHaskellName $ fieldHaskell field
-        ref <- fromForeignRefs $ fieldReference field
+        field <- E.entityFields ent
+        -- We don't handle optional foreign references for now.
+        when ("Maybe" `elem` E.fieldAttrs field) $ []
+        let nm = unHaskellName $ E.fieldHaskell field
+        ref <- fromForeignRefs $ E.fieldReference field
         return ( (Text.unpack entName, Text.unpack ref)
                , [(toField entName nm
                   , Text.unpack $  ref <> "Id")])
   -- References that use explicit »Primary« and »Foreign» declarations
       explicits = do
-        frgn <- entityForeigns ent
-        let remote = unHaskellName $ foreignRefTableHaskell frgn
+        frgn <- E.entityForeigns ent
+        -- Check if the foreign reference involves a maybe field
+        when ("Maybe" `elem` [ attr
+                             -- Find fields the current foreign reference
+                             -- involves
+                             | ((nm,_), _) <- E.foreignFields frgn
+                             -- Find the definitions of these fields in the entity
+                             , field <- E.entityFields ent
+                             , E.fieldHaskell field == nm
+                             -- Return attributes of these fields
+                             , attr <- E.fieldAttrs field
+                             ])
+          []
+
+        let remote = unHaskellName $ E.foreignRefTableHaskell frgn
         return . ((Text.unpack entName,  Text.unpack remote), ) $ do
-          ((HaskellName f, _), (HaskellName t, _)) <- foreignFields frgn
+          ((HaskellName f, _), (HaskellName t, _)) <- E.foreignFields frgn
           return (toField entName f, toField remote t)
   implicits <> explicits
   where
@@ -968,7 +1014,110 @@ mkUniqueRandomHrID fromCandidate len field = do
     candidate <- liftIO $ mkRandomHrID len
     [Value rows] <- db . select . E.from $ \o -> do
         where_ $ o ^. field ==. val (fromCandidate candidate)
-        return $ countRows
+        return $ E.countRows
     if (rows :: Rational) > 0
         then mkUniqueRandomHrID fromCandidate len field
         else return $ fromCandidate candidate
+
+
+instance PersistField UUID.UUID where
+    toPersistValue = toPersistValue . UUID.toString
+    fromPersistValue x = case x of
+        PersistDbSpecific bs ->
+            case UUID.fromASCIIBytes bs of
+             Nothing -> Left $ "Invalid UUID: " <> TS.pack (show bs)
+             Just u -> Right u
+        PersistText txt ->
+            case UUID.fromString $ TS.unpack txt of
+             Nothing -> Left $ "Invalid UUID: " <> TS.pack (show txt)
+             Just u -> Right u
+        e -> Left $ "Can not convert to uuid: " <> TS.pack (show e)
+
+instance PersistFieldSql UUID.UUID where
+    sqlType _ = SqlOther "uuid"
+
+instance PathPiece UUID.UUID where
+    fromPathPiece = UUID.fromString . TS.unpack
+    toPathPiece = TS.pack . UUID.toString
+
+-- | Parse database connection info from configuration file or environment
+-- variables. The relevant variables are
+--
+-- * DB_HOST / db.host (default = "localhost")
+-- * DB_PORT / db.port (default = 5432)
+-- * DB_USER / db.user  (default = "postgres")
+-- * DB_PASSWORD / db.password (default = "")
+-- * DB_DATABASE / db.database (default = "postgres")
+getDBConnectInfo :: (MonadLogger m, MonadIO m) => Config -> m Postgres.ConnectInfo
+getDBConnectInfo conf = do
+  dbHost <- getConf "DB_HOST" "db.host" (Right "localhost") conf
+  dbUser <- getConf "DB_USER" "db.user" (Right "postgres") conf
+  dbDatabase <- getConf "DB_DATABASE" "db.database" (Right "postgres") conf
+  dbPassword <- getConf "DB_PASSWORD" "db.password" (Right "") conf
+  dbPort <- getConf' "DB_PORT" "db.port" (Right 5432) conf
+  return Postgres.ConnectInfo { Postgres.connectPort = dbPort
+                              , Postgres.connectHost = Text.unpack dbHost
+                              , Postgres.connectUser = Text.unpack dbUser
+                              , Postgres.connectDatabase = Text.unpack dbDatabase
+                              , Postgres.connectPassword = Text.unpack dbPassword
+                              }
+
+{-# DEPRECATED withPoolNoWait "use getDBConnectionString to parse database connection info" #-}
+
+withPoolNoWait ::
+     (MonadIO m, MonadUnliftIO m, MonadBaseControl IO m, MonadLogger m)
+  => Config
+  -> Int
+  -> (ConnectionPool -> m b)
+  -> m b
+withPoolNoWait conf n f = do
+    conInfo <- getDBConnectInfo conf
+    let connectionString = Postgres.postgreSQLConnectionString conInfo
+    $logDebug $ "Using connection string: \""
+                <> Text.decodeUtf8 connectionString <> "\""
+    withPostgresqlPool connectionString n f
+
+{-# DEPRECATED withPool "use getDBConnectionString to parse database connection info" #-}
+withPool ::
+     ( MonadIO m
+     , MonadUnliftIO m
+     , MonadBaseControl IO m
+     , MonadLogger m
+     , Ex.MonadCatch m
+     )
+  => Config
+  -> Int
+  -> (ConnectionPool -> m b)
+  -> m b
+withPool conf n f = withPoolNoWait conf n $ \pool -> do
+  runPoolRetry pool (return ())
+  f pool
+
+withDBPool :: (MonadLoggerIO m, MonadUnliftIO m, Ex.MonadCatch m)
+           => Postgres.ConnectInfo -- ^ Connection parameters
+           -> Int -- ^ Maximum number of open connections
+           -> Migration.M () -- ^ Action to run before passing the pool
+                             -- (e.g. migrations)
+           -> (ConnectionPool -> m a)
+           -> m a
+withDBPool conInfo cons migr f = do
+  logger <- askLoggerIO
+  withPostgresqlPool (Postgres.postgreSQLConnectionString conInfo) cons $ \pool -> do
+    liftIO $ runLoggingT (runPoolRetry pool migr) logger
+    f pool
+
+-- | Try to run a database action with a pool and retry until connection can be
+-- established
+runPoolRetry ::
+     (MonadIO m, MonadUnliftIO m, Ex.MonadCatch m, MonadLogger m)
+  => ConnectionPool
+  -> ReaderT SqlBackend m a
+  -> m a
+runPoolRetry pool f =
+    Ex.catchIOError (E.runSqlPool f pool) $ \e -> do
+    liftIO $ threadDelay 1000000
+    $logWarn $
+      "Could not connect to database, retrying ( " <>
+      (Text.pack . show . show $ e) <>
+      ")"
+    runPoolRetry pool f
