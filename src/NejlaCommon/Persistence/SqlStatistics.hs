@@ -1,12 +1,12 @@
+{-# LANGUAGE ApplicativeDo #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE StrictData #-}
-{-# LANGUAGE ApplicativeDo #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 -- | Collect statistics of executed SQL queries.
 --
@@ -17,7 +17,6 @@
 -- To get started, you can just wrap your 'App' actions with 'logSqlStats'. It
 -- will hook the SQL backend, collect the query statistics and log them, e.g. like so:
 -- > App.run pool conf ctx (logSqlStatistics m)
-
 module NejlaCommon.Persistence.SqlStatistics where
 
 import qualified Control.Foldl                    as Foldl
@@ -26,30 +25,37 @@ import           Control.Monad
 import qualified Control.Monad.Catch              as Ex
 import           Control.Monad.Logger             as Log
 import           Control.Monad.Reader
+
 import qualified Data.Aeson                       as Aeson
 import           Data.IORef
 import qualified Data.List                        as List
-import           Data.Map.Strict                  (Map)
+import           Data.Map.Strict                  ( Map )
 import qualified Data.Map.Strict                  as Map
-import           Data.Maybe                       (fromMaybe)
-import           Data.Ord
-import           Data.String.Interpolate.IsString (i)
-import           Data.Text                        (Text)
-import           Data.Time.Clock                  (getCurrentTime)
+import           Data.Maybe                       ( fromMaybe )
+import           Data.String.Interpolate.IsString ( i )
+import           Data.Text                        ( Text )
+import           Data.Time.Clock                  ( getCurrentTime )
 import qualified Data.Time.Clock                  as Time
+
 import qualified Database.Persist.Sql             as P
-import           Text.Printf                      (printf)
+
+#if MIN_VERSION_persistent(2,12,0)
+-- LTS 18
+import qualified Database.Persist.SqlBackend.Internal as P
+#endif
 
 import qualified NejlaCommon.Persistence          as NC
-import           NejlaCommon.Persistence          (App(..))
+import           NejlaCommon.Persistence          ( App(..) )
 
-
+import           Text.Printf                      ( printf )
 
 -- | Individual sample of a query and its execution time.
-data QueryTime = QueryTime
+data QueryTime =
+  QueryTime
   { queryTimeQuery :: Text
   , queryTimeTime  :: Time.NominalDiffTime
   }
+
 makeLensesWith camelCaseFields ''QueryTime
 
 -- | How to fold a sequence of Query Timings into desired statistics
@@ -73,13 +79,14 @@ type StatsFold stats = Foldl.Fold QueryTime stats
 -- /NB/ the backend is /modified/ before the callback function is run and the
 -- modifications are undone one the functions returns. This means that using the
 -- Backend concurrently can have unintended side effects.
-backendWithStats ::
-  MonadIO m => StatsFold stats -- ^ Fold describes how to calculate statistics. See for example 'foldStats'
-            -> P.SqlBackend -- ^ Backend to hook into
-            -> (IO stats
-                -> P.SqlBackend
-                -> m a) -- ^ Callback (what to do with the hooked backend)
-            -> m a
+backendWithStats
+  :: MonadIO m
+  => StatsFold stats -- ^ Fold describes how to calculate statistics. See for example 'foldStats'
+  -> P.SqlBackend -- ^ Backend to hook into
+  -> (IO stats
+      -> P.SqlBackend
+      -> m a) -- ^ Callback (what to do with the hooked backend)
+  -> m a
 backendWithStats (Foldl.Fold fadd fempty fextract) con k = do
   statsRef <- liftIO $ newIORef fempty
   let update x = atomicModifyIORef statsRef $ \stats -> (fadd stats x, ())
@@ -87,7 +94,8 @@ backendWithStats (Foldl.Fold fadd fempty fextract) con k = do
   unhookedStatements <- liftIO $ newIORef =<< readIORef (P.connStmtMap con)
 
   -- Hook all existing statements
-  liftIO $ modifyIORef' (P.connStmtMap con) $ itraversed %@~ (hookedStatement update)
+  liftIO $ modifyIORef' (P.connStmtMap con) $
+    itraversed %@~ hookedStatement update
 
   -- Add hooking to newly created statements
   let prepare statementText = do
@@ -99,49 +107,49 @@ backendWithStats (Foldl.Fold fadd fempty fextract) con k = do
 
   let readStats = fextract <$> readIORef statsRef
   -- Call inner function with the read function and the hooked statement map
-  res <- k readStats con{ P.connPrepare = prepare }
+  res <- k readStats
+           con
+           { P.connPrepare = prepare
+           }
 
   -- Reinstate unhooked statements
   liftIO $ writeIORef (P.connStmtMap con) =<< readIORef unhookedStatements
   -- We don't need bracket because exceptions during statement execution
   -- invalidate the connection anyway
-
   return res
   where
     -- | Execute action f while registering the query and the execution time
-    withStats :: MonadIO m =>
-                 (QueryTime -> IO ())
-              -> Text
-              -> m a
-              -> m a
+    withStats :: MonadIO m => (QueryTime -> IO ()) -> Text -> m a -> m a
     withStats addSample stmt f = do
-      before <- liftIO $ Time.getCurrentTime
+      before <- liftIO Time.getCurrentTime
       res <- f
-      after <- liftIO $ Time.getCurrentTime
+      after <- liftIO Time.getCurrentTime
       let tdiff = after `Time.diffUTCTime` before
-      liftIO $ addSample (QueryTime{queryTimeQuery = stmt
-                                   , queryTimeTime = tdiff
-                                   })
+      liftIO $ addSample (QueryTime
+                          { queryTimeQuery = stmt
+                          , queryTimeTime  = tdiff
+                          })
       return res
 
     hookedStatement addSample statementText stmt = do
-      stmt{ P.stmtExecute = \values -> do
-              withStats addSample statementText (P.stmtExecute stmt values)
-          , P.stmtQuery = \values -> do
-              withStats addSample statementText (P.stmtQuery stmt values)
-          }
+      stmt
+        { P.stmtExecute = \values -> do
+            withStats addSample statementText (P.stmtExecute stmt values)
+        , P.stmtQuery   = \values -> do
+            withStats addSample statementText (P.stmtQuery stmt values)
+        }
 
 --------------------------------------------------------------------------------
 -- Default Statistics ----------------------------------------------------------
 --------------------------------------------------------------------------------
-
 -- | Query statistics. Knowing how often a query ran, the total executation time
 -- and the longest run gives us enough information to debug many performance
 -- problems.
-data Stats = Stats
-  { statsCount :: Int -- ^ Number of times this statement was executed
+data Stats =
+  Stats
+  { statsCount     :: Int -- ^ Number of times this statement was executed
   , statsTotalTime :: Time.NominalDiffTime -- ^ Total duration spent in this query
-  , statsMaxTime :: Time.NominalDiffTime -- ^ Longest run of this query
+  , statsMaxTime   :: Time.NominalDiffTime -- ^ Longest run of this query
   }
 
 makeLensesWith camelCaseFields ''Stats
@@ -149,39 +157,39 @@ makeLensesWith camelCaseFields ''Stats
 -- | Default / example fold how to calculate statistics from individual query
 -- execution times. Collects for each executed query (as Text) the runtime statistics
 foldStats :: StatsFold (Map Text Stats)
-foldStats  = Foldl.groupBy (view query) . lmap (view time) $ do
+foldStats = Foldl.groupBy (view query) . lmap (view time) $ do
   -- Make use of Foldl's Applicative instance.
   count <- Foldl.length
   total <- Foldl.sum
   max <- fromMaybe 0 <$> Foldl.maximum
-  return $ Stats { statsCount = count
-                 , statsTotalTime = total
-                 , statsMaxTime = max
-                 }
+  return $ Stats
+    { statsCount     = count
+    , statsTotalTime = total
+    , statsMaxTime   = max
+    }
 
 -- | Logging the calculated statistics
 logQueryStats :: (MonadIO m, MonadLogger m)
               => Text -- ^ Endpoint
               -> Bool -- Break down stats by query
-              -> (Map Text Stats)
+              -> Map Text Stats
               -> m ()
 logQueryStats endpoint breakdown stats = do
-  now <- liftIO $ getCurrentTime
-  let tCount = sumOf (each . count) stats
-      tUnique = Map.size stats
-      tTime = sumOf (each . totalTime) stats
-      tTimePerQuery = if tCount > 0
-                      then tTime / (fromIntegral tCount)
-                      else  0
+  now <- liftIO getCurrentTime
+  let tCount        = sumOf (each . count) stats
+      tUnique       = Map.size stats
+      tTime         = sumOf (each . totalTime) stats
+      tTimePerQuery = if tCount > 0 then tTime / fromIntegral tCount else 0
       tLongestQuery = fromMaybe 0 $ maximumOf (each . maxTime) stats
   when breakdown $ do
-    let queries = List.sortBy (comparing $ view (_2 . totalTime))
-                    $ Map.toList stats
+    let queries = List.sortOn (view (_2 . totalTime)) $ Map.toList stats
 
-    forM_ (queries) $ \(query, stat) -> do
+    forM_ queries $ \(query, stat) -> do
       Log.logDebugNS "SQL-stats" $ "  > " <> query
-      Log.logDebugNS "SQL-stats" [i| Ran #{stat ^. count} times, total=#{stat ^. totalTime}, max=#{stat ^. maxTime})|]
-  Log.logInfoNS "SQL-stats" [i|{"request":#{Aeson.encode endpoint}, "timestamp": #{Aeson.encode now}, "queries":#{tCount}, "unique":#{tUnique}, "totalTime":#{tDiff tTime}, "avgTime":#{tDiff tTimePerQuery}, "maxTime":#{tDiff tLongestQuery}}|]
+      Log.logDebugNS "SQL-stats"
+                     [i| Ran #{stat ^. count} times, total=#{stat ^. totalTime}, max=#{stat ^. maxTime})|]
+  Log.logInfoNS "SQL-stats"
+                [i|{"request":#{Aeson.encode endpoint}, "timestamp": #{Aeson.encode now}, "queries":#{tCount}, "unique":#{tUnique}, "totalTime":#{tDiff tTime}, "avgTime":#{tDiff tTimePerQuery}, "maxTime":#{tDiff tLongestQuery}}|]
   return ()
   where
     tDiff :: RealFrac a => a -> String
@@ -193,8 +201,10 @@ logSqlStatistics :: Text -- ^ Context to log (e.g. the request endpoint)
                  -> App priv tl st a
                  -> App priv tl st a
 logSqlStatistics ctx (NC.App m) = do
-  st <- NC.App $ ask
-  backendWithStats foldStats (st ^. NC.connection) (\getStats con ->
-    (NC.App $ ReaderT $ \_ -> runReaderT m (st & NC.connection .~ con))
-    `Ex.finally` ( logQueryStats ctx True =<< liftIO getStats)
-                                                   )
+  st <- NC.App ask
+  backendWithStats foldStats
+                   (st ^. NC.connection)
+                   (\getStats con ->
+                    NC.App (ReaderT $ \_ ->
+                            runReaderT m (st & NC.connection .~ con))
+                    `Ex.finally` (logQueryStats ctx True =<< liftIO getStats))
