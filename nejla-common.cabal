@@ -1,10 +1,8 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.34.4.
+-- This file has been generated from package.yaml by hpack version 0.34.7.
 --
 -- see: https://github.com/sol/hpack
---
--- hash: c214c9d8538794f867f87963ba8d2b710d7acef53f58e4d6ed3bb62b9d720513
 
 name:           nejla-common
 version:        0.1.0.0
@@ -19,6 +17,10 @@ license:        BSD3
 license-file:   LICENSE
 build-type:     Simple
 
+flag new-singletons
+  manual: False
+  default: True
+
 library
   exposed-modules:
       NejlaCommon
@@ -31,8 +33,8 @@ library
       NejlaCommon.Test.Logging
       NejlaCommon.Test.Expectation
       NejlaCommon.Persistence.Migration
-      NejlaCommon.Persistence.SqlStatistics
   other-modules:
+      NejlaCommon.Component
       NejlaCommon.Logging
       NejlaCommon.Persistence
       NejlaCommon.Persistence.Compat
@@ -79,9 +81,12 @@ library
     , random
     , random-shuffle
     , resourcet
-    , singletons >=1.1
+    , servant
+    , servant-server
+    , servant-swagger
     , stm
     , stm-chans
+    , swagger2
     , template-haskell >=2.12
     , text
     , th-lift-instances
@@ -97,6 +102,14 @@ library
   if impl(ghc >= 8.10)
     default-extensions:
         StandaloneKindSignatures
+  if flag(new-singletons)
+    build-depends:
+        singletons >=3.0
+      , singletons-base
+      , singletons-th
+  else
+    build-depends:
+        singletons >=1.1 && <3.0
   default-language: Haskell2010
 
 test-suite tests
@@ -140,8 +153,12 @@ test-suite tests
     , persistent-postgresql
     , persistent-template
     , postgresql-simple
+    , servant
+    , servant-server
+    , servant-swagger
     , shelly
     , singletons
+    , swagger2
     , tasty
     , tasty-hunit
     , tasty-quickcheck
@@ -155,4 +172,12 @@ test-suite tests
   if impl(ghc >= 8.10)
     default-extensions:
         StandaloneKindSignatures
+  if flag(new-singletons)
+    build-depends:
+        singletons >=3.0
+      , singletons-base
+      , singletons-th
+  else
+    build-depends:
+        singletons >=1.1 && <3.0
   default-language: Haskell2010
