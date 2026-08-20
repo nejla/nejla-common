@@ -1,12 +1,12 @@
 name: nejla-common
-version: '0.1.0.0'
+version: "0.1.0.0"
 synopsis: Common functionality for Nejla Reference Architecture applications
 description: Common functionality for Nejla Reference Architecture applications.
 category: Development
 maintainer: info@nejla.com
 copyright:
   - Nejla AB
-  - '2014-2021'
+  - "2014-2026"
 license: BSD3
 homepage: https://github.com/nejla/nejla-common
 
@@ -32,10 +32,11 @@ when:
 dependencies:
   - aeson
   - bytestring
+  - conduit
   - configurator
   - containers
   - data-default
-  - esqueleto < 3.6
+  - esqueleto >= 3.6
   - fast-logger
   - HUnit
   - insert-ordered-containers
@@ -47,6 +48,7 @@ dependencies:
   - persistent-template
   - postgresql-simple
   - servant
+  - servant-conduit
   - servant-multipart
   - servant-server
   - servant-openapi3
@@ -82,26 +84,30 @@ library:
     - NejlaCommon.Config
     - NejlaCommon.Helpers
     - NejlaCommon.JSON
+    - NejlaCommon.OpenApi
+    - NejlaCommon.OpenApi.Nullable
+    - NejlaCommon.OpenApi.Operation
     - NejlaCommon.Orphans
-    - NejlaCommon.Sendmail
-    - NejlaCommon.Test
-    - NejlaCommon.Test.Postgres
-    - NejlaCommon.Test.Json
-    - NejlaCommon.Test.Logging
-    - NejlaCommon.Test.Expectation
     - NejlaCommon.Persistence
-    - NejlaCommon.Persistence.Util
     - NejlaCommon.Persistence.Compat
     - NejlaCommon.Persistence.Migration
     - NejlaCommon.Persistence.Migration.CLI
     - NejlaCommon.Persistence.SqlStatistics
-    - NejlaCommon.OpenApi
-    - NejlaCommon.OpenApi.Operation
-    - NejlaCommon.OpenApi.Nullable
+    - NejlaCommon.Persistence.Util
+    - NejlaCommon.RateLimiter
+    - NejlaCommon.Sendmail
+    - NejlaCommon.Servant.ByteStream
+    - NejlaCommon.Test
+    - NejlaCommon.Test.Api
+    - NejlaCommon.Test.Expectation
+    - NejlaCommon.Test.Golden
+    - NejlaCommon.Test.Json
+    - NejlaCommon.Test.Logging
+    - NejlaCommon.Test.Postgres
   dependencies:
     - base >=4.7 && <5.0
+    - Diff
     - async
-    - optparse-applicative
     - binary
     - case-insensitive >=1.2
     - exceptions >=0.8
@@ -115,7 +121,9 @@ library:
     - microstache
     - mime-mail
     - mtl >=2.2
+    - optparse-applicative
     - path-pieces
+    - pretty-simple
     - process
     - random
     - random-shuffle
@@ -127,6 +135,7 @@ library:
     - time >=1.5
     - transformers
     - transformers-base
+    - unliftio
     - unliftio-core
     - uuid
     - wai

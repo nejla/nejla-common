@@ -12,7 +12,7 @@ category:       Development
 homepage:       https://github.com/nejla/nejla-common
 maintainer:     info@nejla.com
 copyright:      Nejla AB,
-                2014-2021
+                2014-2026
 license:        BSD3
 license-file:   LICENSE
 build-type:     Simple
@@ -27,22 +27,26 @@ library
       NejlaCommon.Config
       NejlaCommon.Helpers
       NejlaCommon.JSON
+      NejlaCommon.OpenApi
+      NejlaCommon.OpenApi.Nullable
+      NejlaCommon.OpenApi.Operation
       NejlaCommon.Orphans
-      NejlaCommon.Sendmail
-      NejlaCommon.Test
-      NejlaCommon.Test.Postgres
-      NejlaCommon.Test.Json
-      NejlaCommon.Test.Logging
-      NejlaCommon.Test.Expectation
       NejlaCommon.Persistence
-      NejlaCommon.Persistence.Util
       NejlaCommon.Persistence.Compat
       NejlaCommon.Persistence.Migration
       NejlaCommon.Persistence.Migration.CLI
       NejlaCommon.Persistence.SqlStatistics
-      NejlaCommon.OpenApi
-      NejlaCommon.OpenApi.Operation
-      NejlaCommon.OpenApi.Nullable
+      NejlaCommon.Persistence.Util
+      NejlaCommon.RateLimiter
+      NejlaCommon.Sendmail
+      NejlaCommon.Servant.ByteStream
+      NejlaCommon.Test
+      NejlaCommon.Test.Api
+      NejlaCommon.Test.Expectation
+      NejlaCommon.Test.Golden
+      NejlaCommon.Test.Json
+      NejlaCommon.Test.Logging
+      NejlaCommon.Test.Postgres
   other-modules:
       NejlaCommon.Component
       NejlaCommon.Logging
@@ -52,17 +56,19 @@ library
       src
   ghc-options: -Wall -Werror=incomplete-patterns -Werror=incomplete-uni-patterns -Werror=incomplete-record-updates -Werror=unused-local-binds -Werror=unused-pattern-binds -Werror=unused-top-binds -Werror=unused-matches -Werror=missing-signatures -Werror=unused-foralls -Wno-deprecations -Wno-name-shadowing -Wno-missed-extra-shared-lib
   build-depends:
-      HUnit
+      Diff
+    , HUnit
     , aeson
     , async
     , base >=4.7 && <5.0
     , binary
     , bytestring
     , case-insensitive >=1.2
+    , conduit
     , configurator
     , containers
     , data-default
-    , esqueleto <3.6
+    , esqueleto >=3.6
     , exceptions >=0.8
     , fast-logger
     , foldl
@@ -86,11 +92,13 @@ library
     , persistent-postgresql
     , persistent-template
     , postgresql-simple
+    , pretty-simple
     , process
     , random
     , random-shuffle
     , resourcet
     , servant
+    , servant-conduit
     , servant-multipart
     , servant-openapi3
     , servant-server
@@ -103,6 +111,7 @@ library
     , time >=1.5
     , transformers
     , transformers-base
+    , unliftio
     , unliftio-core
     , unordered-containers
     , uuid
@@ -152,10 +161,11 @@ test-suite tests
     , async
     , base
     , bytestring
+    , conduit
     , configurator
     , containers
     , data-default
-    , esqueleto <3.6
+    , esqueleto >=3.6
     , exceptions
     , fast-logger
     , formatting
@@ -173,6 +183,7 @@ test-suite tests
     , persistent-template
     , postgresql-simple
     , servant
+    , servant-conduit
     , servant-multipart
     , servant-openapi3
     , servant-server
